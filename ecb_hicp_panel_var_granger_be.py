@@ -150,6 +150,118 @@ infl_panel, infl_long = fetch_ecb_hicp_inflation_panel(
     end="2025-12"   # optional
 )
 
+# -----------------------------------
+# Fetch Ukraine inflation time series
+
+def fetch_ukraine_cpi_prev_month_raw(
+    start="2000-01",
+    end="2025-12",
+    timeout=60
+):
+    """
+    Fetch Ukraine CPI (previous month = 100) from the SSSU SDMX API v3 and return
+    the raw SDMX-CSV as a DataFrame (no date/numeric parsing).
+    """
+    base = "https://stat.gov.ua/sdmx/workspaces/default:integration/registry/sdmx/3.0/data"
+    agency = "SSSU"
+    flow = "DF_PRICE_CHANGE_CONSUMER_GOODS_SERVICE"
+    version = "~"
+    key = "INDEX_CONSUMPRICE.PREV_MONTH.UA00000000000000000.0.M"
+
+    url = f"{base}/dataflow/{agency}/{flow}/{version}/{key}"
+    params = {"c[TIME_PERIOD]": f"ge:{start}+le:{end}"}
+    headers = {
+        "Accept": "application/vnd.sdmx.data+csv;version=2.0.0;labels=id;timeFormat=normalized;keys=both",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+    r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    r.raise_for_status()
+
+    raw = pd.read_csv(StringIO(r.text), dtype=str)
+
+    # --- MINIMAL FIX: some responses include metadata rows.
+    # Keep only rows that look like monthly observations and have OBS_VALUE.
+    raw = raw.loc[
+        raw["TIME_PERIOD"].astype(str).str.match(r"^\d{4}-M\d{2}$", na=False)
+        & raw["OBS_VALUE"].notna()
+    ].copy()
+
+    return raw
+
+
+# Example
+ua_raw = fetch_ukraine_cpi_prev_month_raw(start="2000-01", end="2025-12")
+print(ua_raw.head())
+print(ua_raw["TIME_PERIOD"].unique()[:12])
+print(ua_raw["OBS_VALUE"].unique()[:12])
+
+
+
+# ua_raw is your DataFrame as read from the SDMX-CSV response
+# (i.e., it already has columns like TIME_PERIOD, OBS_VALUE)
+
+def ua_raw_to_monthly_series(ua_raw: pd.DataFrame) -> pd.Series:
+    """
+    Build a clean monthly time series from SSSU SDMX-CSV raw output.
+
+    Input:
+      ua_raw: DataFrame with at least TIME_PERIOD like '2000-M01' and OBS_VALUE strings.
+
+    Output:
+      pd.Series indexed by month-start Timestamp, name='UA_IDX_PREV_MONTH_100'
+    """
+    if "TIME_PERIOD" not in ua_raw.columns or "OBS_VALUE" not in ua_raw.columns:
+        raise ValueError(f"ua_raw must contain TIME_PERIOD and OBS_VALUE. Columns: {list(ua_raw.columns)}")
+
+    s = ua_raw[["TIME_PERIOD", "OBS_VALUE"]].copy()
+
+    # Keep only true monthly tokens like YYYY-Mmm (defensive)
+    s["TIME_PERIOD"] = s["TIME_PERIOD"].astype(str).str.strip()
+    s = s[s["TIME_PERIOD"].str.match(r"^\d{4}-M\d{2}$", na=False)]
+
+    # Convert 'YYYY-Mmm' -> Timestamp at month start
+    # Example: '2000-M01' -> '2000-01-01'
+    s["TIME_PERIOD"] = pd.to_datetime(
+        s["TIME_PERIOD"].str.replace(r"^(\d{4})-M(\d{2})$", r"\1-\2-01", regex=True),
+        errors="coerce"
+    )
+
+    # Values
+    s["OBS_VALUE"] = pd.to_numeric(s["OBS_VALUE"].astype(str).str.replace(",", ".", regex=False),
+                                   errors="coerce")
+
+    s = s.dropna(subset=["TIME_PERIOD", "OBS_VALUE"]).sort_values("TIME_PERIOD")
+
+    out = s.set_index("TIME_PERIOD")["OBS_VALUE"].rename("UA_IDX_PREV_MONTH_100")
+
+    # If duplicates exist for a month (shouldn't, but safe): keep last
+    out = out.groupby(level=0).last()
+
+    return out
+
+# Build the monthly series (prev month = 100)
+ua_idx = ua_raw_to_monthly_series(ua_raw)
+
+# Optional: restrict window (month-start)
+ua_idx = ua_idx.loc["2000-01-01":"2025-12-01"]
+
+# If you still need y/y inflation (%):
+def cpi_prev_month_index_to_yoy_inflation(idx_prev_month_100: pd.Series) -> pd.Series:
+    monthly_factor = (idx_prev_month_100 / 100.0).astype(float)
+    yoy_factor = monthly_factor.rolling(12).apply(np.prod, raw=True)
+    return ((yoy_factor - 1.0) * 100.0).rename("UA")
+
+ua_yoy = cpi_prev_month_index_to_yoy_inflation(ua_idx)
+
+# Ensure month-start indices match
+infl_panel = infl_panel.copy()
+infl_panel.index = pd.to_datetime(infl_panel.index).to_period("M").to_timestamp(how="start")
+ua_yoy.index = pd.to_datetime(ua_yoy.index).to_period("M").to_timestamp(how="start")
+
+infl_panel = infl_panel.join(ua_yoy, how="left")
+
+
 # ------------------------------------------------------------
 # Plot the inflation panel (one line per country)
 # Assumes `infl_panel` is the wide DataFrame returned above:
@@ -195,20 +307,20 @@ adf_table = pd.DataFrame(adf_results).sort_values("pvalue")
 print(adf_table.to_string(index=False))
 
 # -------------------------
-# 2) Granger causality: X → BE
+# 2) Granger causality: X → UA
 #    (bivariate, simple ranking)
 # -------------------------
 maxlag = 6   # keep small for undergrads
 
-print("\n=== Granger causality tests: X → BE ===")
+print("\n=== Granger causality tests: X → UA ===")
 
 granger_out = []
 
 for c in df.columns:
-    if c == "BE":
+    if c == "UA":
         continue
 
-    data_gc = df[["BE", c]]
+    data_gc = df[["UA", c]]
 
     try:
         res = grangercausalitytests(data_gc, maxlag=maxlag, verbose=False)
@@ -230,15 +342,15 @@ granger_rank = (
     .reset_index(drop=True)
 )
 
-print("\n=== Ranking of countries by Granger causality for BE ===")
+print("\n=== Ranking of countries by Granger causality for UA ===")
 print(granger_rank.to_string(index=False))
 
 # -------------------------
 # 3) Simple VAR with BIC
-#    (BE + top 2 predictors)
+#    (UA + top 2 predictors)
 # -------------------------
 top_countries = granger_rank["country"].iloc[:2].tolist()
-var_vars = ["BE"] + top_countries
+var_vars = ["UA"] + top_countries
 
 print("\nVAR variables:", var_vars)
 
